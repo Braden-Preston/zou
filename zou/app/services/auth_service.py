@@ -4,7 +4,6 @@ import string
 import flask_bcrypt
 from datetime import datetime, timedelta
 
-
 from flask import request
 from babel.dates import format_datetime
 
@@ -14,6 +13,10 @@ from ldap3.core.exceptions import (
     LDAPSocketOpenError,
     LDAPInvalidCredentialsResult,
 )
+from pyrad import packet
+from pyrad.client import Client
+from pyrad.dictionary import Dictionary
+from pyrad.client import Timeout as RadiusTimeout
 
 from zou.app.services import persons_service
 from zou.app.models.person import Person
@@ -29,6 +32,7 @@ from zou.app.services.exception import (
     TwoFactorAuthenticationNotEnabledException,
     UnactiveUserException,
     UserCantConnectDueToNoFallback,
+    RadiusServerTimeout,
     WrongOTPException,
     WrongPasswordException,
     WrongUserException,
@@ -80,21 +84,20 @@ def check_auth(
             no_password_auth_strategy(person, password, app)
         elif strategy == "auth_remote_ldap":
             ldap_auth_strategy(person, password, app)
+        elif strategy == "auth_remote_radius":
+            radius_auth_strategy(person, password, app)
         else:
             raise NoAuthStrategyConfigured()
     except WrongPasswordException:
-        update_login_failed_attemps(
-            person["id"], login_failed_attemps + 1, datetime.now()
-        )
+        update_login_failed_attemps(person["id"], login_failed_attemps + 1,
+                                    datetime.now())
         raise WrongPasswordException()
 
     if not no_otp and person_two_factor_authentication_enabled(person):
-        if not check_two_factor_authentication(
-            person, totp, email_otp, recovery_code
-        ):
-            update_login_failed_attemps(
-                person["id"], login_failed_attemps + 1, datetime.now()
-            )
+        if not check_two_factor_authentication(person, totp, email_otp,
+                                               recovery_code):
+            update_login_failed_attemps(person["id"], login_failed_attemps + 1,
+                                        datetime.now())
             raise WrongOTPException()
 
     if login_failed_attemps > 0:
@@ -132,8 +135,7 @@ def local_auth_strategy(person, password, app=None):
     try:
         password_hash = person["password"] or ""
         if password_hash and flask_bcrypt.check_password_hash(
-            password_hash, password
-        ):
+                password_hash, password):
             return person
         else:
             raise WrongPasswordException()
@@ -188,19 +190,83 @@ def ldap_auth_strategy(person, password, app):
 
         except LDAPSocketOpenError:
             app.logger.error(
-                "Cannot connect to LDAP/Active directory server %s "
-                % (ldap_server)
-            )
+                "Cannot connect to LDAP/Active directory server %s " %
+                (ldap_server))
             raise LDAPSocketOpenError()
 
         except LDAPInvalidCredentialsResult:
-            app.logger.error(
-                "LDAP cannot authenticate user: %s" % person["email"]
-            )
+            app.logger.error("LDAP cannot authenticate user: %s" %
+                             person["email"])
             raise WrongPasswordException()
 
     elif app.config["LDAP_FALLBACK"]:
         return local_auth_strategy(person, password, app)
+    else:
+        raise UserCantConnectDueToNoFallback()
+
+
+def radius_auth_strategy(person, password, app):
+    """
+    Connect to a RADIUS server to know if given user can be
+    authenticated.
+    When person is not from RADIUS, it can try to connect with the LDAP stragety
+    as a fallback.
+    (only if fallback is activated (via RADIUS_FALLBACK flag) in configuration)
+    """
+
+    username = person["desktop_login"]
+    excluded_accounts = app.config["RADIUS_EXCLUDED_ACCOUNTS"]
+
+    # e-account users
+    if username not in excluded_accounts: # e-user acounts
+
+        app.logger.error(username)
+        app.logger.error(password)
+        app.logger.error(excluded_accounts)
+
+        # TODO for each server address and secret
+
+        try:
+            # Create client
+            client = Client(
+                server="localhost",
+                secret=b"Kah3choteereethiejeimaeziecumi",
+                dict=Dictionary("/etc/radius/dictionary"),
+                timeout=1,
+            )
+
+            # Create request
+            req = client.CreateAuthPacket(code=packet.AccessRequest, )
+            req["User-Name"] = str(username)
+            req["User-Password"] = req.PwCrypt("password")
+            req["NAS-Identifier"] = "localhost"
+
+            # echo "User-Name=test,User-Password=mypass,Framed-Protocol=PPP " | /usr/local/bin/radclient localhost:1812 auth s3cr3t
+
+            # Send request
+            reply = client.SendPacket(req)
+            if reply.code == packet.AccessAccept:
+                app.logger.info("Radius auth success")
+            else:
+                app.logger.error("Radius auth FAIL")
+
+            # if reply.code ==
+            for i in reply.keys():
+                app.logger.info("%s: %s" % (i, reply[i]))
+
+        except RadiusTimeout:
+            app.logger.error("Radius server (%s) could not be reached" %
+                             "localhost")
+            raise RadiusServerTimeout()
+
+        # return person
+        raise UserCantConnectDueToNoFallback()
+
+    elif app.config["RADIUS_FALLBACK"]:
+        if person["is_generated_from_ldap"]:
+            return ldap_auth_strategy(person, password, app) # a-dash accounts
+        else:
+            return local_auth_strategy(person, password, app) #local accounts
     else:
         raise UserCantConnectDueToNoFallback()
 
@@ -212,19 +278,16 @@ def check_login_failed_attemps(person):
     login_failed_attemps = person["login_failed_attemps"]
     if login_failed_attemps is None:
         login_failed_attemps = 0
-    if (
-        login_failed_attemps >= 5
-        and date_helpers.get_datetime_from_string(person["last_login_failed"])
-        + timedelta(minutes=1)
-        > datetime.now()
-    ):
+    if (login_failed_attemps >= 9999 and
+            date_helpers.get_datetime_from_string(person["last_login_failed"])
+            + timedelta(minutes=1) > datetime.now()):
         raise TooMuchLoginFailedAttemps()
     return login_failed_attemps
 
 
-def update_login_failed_attemps(
-    person_id, login_failed_attemps, last_login_failed=None
-):
+def update_login_failed_attemps(person_id,
+                                login_failed_attemps,
+                                last_login_failed=None):
     """
     Update login failed attemps for a person_id.
     """
@@ -237,9 +300,10 @@ def update_login_failed_attemps(
     return person.serialize()
 
 
-def check_two_factor_authentication(
-    person, totp=None, email_otp=None, recovery_code=None
-):
+def check_two_factor_authentication(person,
+                                    totp=None,
+                                    email_otp=None,
+                                    recovery_code=None):
     """
     Check multifactor authentication for a person.
     """
@@ -299,8 +363,7 @@ def check_email_otp(person, email_otp):
     count = auth_tokens_store.get("email-otp-count-%s" % person["email"])
     if count is not None:
         if pyotp.HOTP(person["email_otp_secret"]).verify(
-            email_otp, int(count)
-        ):
+                email_otp, int(count)):
             auth_tokens_store.delete("email-otp-count-%s" % person["email"])
             return True
     return False
@@ -328,9 +391,9 @@ def pre_enable_totp(person_id):
         person.totp_secret = pyotp.random_base32()
         totp = pyotp.TOTP(person.totp_secret)
         organisation = persons_service.get_organisation()
-        totp_provisionning_uri = totp.provisioning_uri(
-            name=person.email, issuer_name="Kitsu %s" % organisation["name"]
-        )
+        totp_provisionning_uri = totp.provisioning_uri(name=person.email,
+                                                       issuer_name="Kitsu %s" %
+                                                       organisation["name"])
         person.totp_enabled = False
         person.commit()
         persons_service.clear_person_cache()
@@ -441,9 +504,9 @@ def send_email_otp(person):
     """
     count = random.randint(0, 999999999999)
     otp = pyotp.HOTP(person["email_otp_secret"]).at(count)
-    auth_tokens_store.add(
-        "email-otp-count-%s" % person["email"], count, ttl=60 * 5
-    )
+    auth_tokens_store.add("email-otp-count-%s" % person["email"],
+                          count,
+                          ttl=60 * 5)
     organisation = persons_service.get_organisation()
     time_string = format_datetime(
         datetime.utcnow(),
@@ -508,15 +571,13 @@ def register_tokens(app, access_token, refresh_token=None):
     can be used like a session.
     """
     access_jti = get_jti(encoded_token=access_token)
-    auth_tokens_store.add(
-        access_jti, "false", app.config["JWT_ACCESS_TOKEN_EXPIRES"]
-    )
+    auth_tokens_store.add(access_jti, "false",
+                          app.config["JWT_ACCESS_TOKEN_EXPIRES"])
 
     if refresh_token is not None:
         refresh_jti = get_jti(encoded_token=refresh_token)
-        auth_tokens_store.add(
-            refresh_jti, "false", app.config["JWT_REFRESH_TOKEN_EXPIRES"]
-        )
+        auth_tokens_store.add(refresh_jti, "false",
+                              app.config["JWT_REFRESH_TOKEN_EXPIRES"])
 
 
 def revoke_tokens(app, jti):
@@ -530,20 +591,17 @@ def is_default_password(app, password):
     """
     Check if password is default.
     """
-    return (
-        password == "default"
-        and app.config["AUTH_STRATEGY"] != "auth_local_no_password"
-    )
+    return (password == "default"
+            and app.config["AUTH_STRATEGY"] != "auth_local_no_password")
 
 
 def generate_reset_token():
     """
     Generate and return a reset token.
     """
-    return "".join(
-        random.SystemRandom().choice(string.ascii_uppercase + string.digits)
-        for _ in range(64)
-    )
+    return "".join(random.SystemRandom().choice(string.ascii_uppercase +
+                                                string.digits)
+                   for _ in range(64))
 
 
 def generate_recovery_codes():
@@ -551,12 +609,8 @@ def generate_recovery_codes():
     Generate and return recovery codes.
     """
     return [
-        "".join(
-            random.SystemRandom().choice(
-                string.ascii_uppercase + string.digits
-            )
-            for _ in range(10)
-        )
+        "".join(random.SystemRandom().choice(string.ascii_uppercase +
+                                             string.digits) for _ in range(10))
         for _ in range(16)
     ]
 
@@ -578,11 +632,8 @@ def check_login_failed_attemps(person):
     login_failed_attemps = person["login_failed_attemps"]
     if login_failed_attemps is None:
         login_failed_attemps = 0
-    if (
-        login_failed_attemps >= 5
-        and date_helpers.get_datetime_from_string(person["last_login_failed"])
-        + timedelta(minutes=1)
-        > datetime.now()
-    ):
+    if (login_failed_attemps >= 9999 and
+            date_helpers.get_datetime_from_string(person["last_login_failed"])
+            + timedelta(minutes=1) > datetime.now()):
         raise TooMuchLoginFailedAttemps()
     return login_failed_attemps

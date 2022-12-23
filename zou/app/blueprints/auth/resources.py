@@ -32,6 +32,7 @@ from zou.app.services.exception import (
     TOTPNotEnabledException,
     UnactiveUserException,
     UserCantConnectDueToNoFallback,
+    RadiusServerTimeout,
     WrongOTPException,
     WrongPasswordException,
     WrongUserException,
@@ -336,6 +337,11 @@ class LoginResource(Resource):
         except UserCantConnectDueToNoFallback:
             current_app.logger.info(
                 "User %s can't login due to no fallback from LDAP." % email
+            )
+            return {"login": False}, 400
+        except RadiusServerTimeout:
+            current_app.logger.info(
+                "User %s can't login due to timeout from RADIUS server." % email
             )
             return {"login": False}, 400
         except TimeoutError:

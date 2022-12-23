@@ -118,6 +118,10 @@ LDAP_IS_AD = envtobool("LDAP_IS_AD", False)
 LDAP_IS_AD_SIMPLE = envtobool("LDAP_IS_AD_SIMPLE", False)
 LDAP_SSL = envtobool("LDAP_SSL", False)
 
+RADIUS_EXCLUDED_ACCOUNTS = os.getenv("RADIUS_EXCLUDED_ACCOUNTS", "").split(",")
+RADIUS_CONFIG = os.getenv("RADIUS_CONFIG", "/etc/pam_radius.conf")
+RADIUS_FALLBACK = envtobool("RADIUS_FALLBACK", False)
+RADIUS_IS_AD = envtobool("RADIUS_IS_AD", False)
 
 LOGS_MODE = os.getenv("LOGS_MODE", "default")
 LOGS_HOST = os.getenv("LOGS_HOST", "localhost")

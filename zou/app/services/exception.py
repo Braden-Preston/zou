@@ -199,6 +199,10 @@ class UserCantConnectDueToNoFallback(Exception):
     pass
 
 
+class RadiusServerTimeout(Exception):
+    pass
+
+
 class UnactiveUserException(Exception):
     pass
 
